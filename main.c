@@ -453,10 +453,9 @@ static void MAIN_GUS_ProcessDMA(void)
         if(is_mapped)
             DPMI_UnmappMemory(mapped);
 
-        if (gstate->dma_irq_pending) {
-            gstate->dma_irq_pending = 0;
-            MAIN_InvokeIRQ(gstate->irq);
-        }
+        // Não chamamos MAIN_InvokeIRQ aqui; o VGUS_TickTimers cuidará da IRQ
+        // com edge-trigger, evitando duplicação.
+        // Apenas registramos que há IRQ pendente (feito em VGUS_DMATransfer).
     }
 }
 #endif // SBEMU_GUS (ProcessDMA)
@@ -603,9 +602,9 @@ static void MAIN_SetBlasterEnv(struct MAIN_OPT* opt) //alter BLASTER env.
 static void MAIN_SetUltraSndEnv(struct MAIN_OPT* opt)
 {
     // ULTRASND format: A<base>,D<dma8>,D<dma16>,I<irq>,I<irq>
-    // e.g.: "240,1,1,5,5"
+    // e.g.: "A240,D1,D1,I5,I5"
     char buf[64];
-    sprintf(buf, "%x,%d,%d,%d,%d",
+    sprintf(buf, "A%x,D%d,D%d,I%d,I%d",
         opt[OPT_GUS_ADDR].value,
         opt[OPT_GUS_DMA].value,
         opt[OPT_GUS_DMA].value,
@@ -1050,21 +1049,27 @@ int main(int argc, char* argv[])
 #endif // SBEMU_GUS
 
 #if SBEMU_DISNEY
-    // Disney Sound Source / Covox emulation (LPT1 parallel port DAC)
+    // Disney Sound Source / Covox emulation (LPT1/LPT2/LPT3 parallel port DAC)
     {
-        static SBEMU_IODT MAIN_DISNEY_IODT[3];
+        static SBEMU_IODT MAIN_DISNEY_IODT[9];  // 3 bases × 3 portas
         static SBEMU_IOPT MAIN_DISNEY_IOPT;
         static BOOL DisneyInstalled = FALSE;
-        // Ports 0x378 (Data), 0x379 (Status), 0x37A (Control)
-        MAIN_DISNEY_IODT[0].port = VDISNEY_BASE + 0;
-        MAIN_DISNEY_IODT[1].port = VDISNEY_BASE + 1;
-        MAIN_DISNEY_IODT[2].port = VDISNEY_BASE + 2;
-        for(int i = 0; i < 3; i++) {
-            MAIN_DISNEY_IODT[i].handler = (void*)VDISNEY_IOHandler;
+
+        // Bases de porta paralela padrão: LPT1, LPT2, LPT3
+        static const uint16_t disney_bases[] = {0x378, 0x278, 0x3BC};
+        int idx = 0;
+
+        for (int b = 0; b < 3; b++) {
+            for (int i = 0; i < 3; i++) {
+                MAIN_DISNEY_IODT[idx].port = disney_bases[b] + i;
+                MAIN_DISNEY_IODT[idx].handler = (void*)VDISNEY_IOHandler;
+                idx++;
+            }
         }
+
         VDISNEY_Init(aui.freq_card);
-        DisneyInstalled = VDPMI_Install_IOPortTrap(MAIN_DISNEY_IODT, 3, &MAIN_DISNEY_IOPT);
-        printf("Disney Sound Source emulation (LPT1 0x378): ");
+        DisneyInstalled = VDPMI_Install_IOPortTrap(MAIN_DISNEY_IODT, idx, &MAIN_DISNEY_IOPT);
+        printf("Disney Sound Source emulation (LPT1/2/3): ");
         MAIN_Print_Enabled_Newline(DisneyInstalled);
     }
 #endif // SBEMU_DISNEY
@@ -1219,7 +1224,9 @@ static void MAIN_Interrupt()
 
     //_LOG("samples:%d\n",samples);
 
+    RESETIF();
     BOOL vmpu_active = VMPU_IsActive();
+    SETIF();
     BOOL opl_active = MAIN_Options[OPT_OPL].value && !fm_aui.fm && OPL3EMU_IsActive();
     BOOL digital = SBEMU_HasStarted();
     BOOL paused = SBEMU_IsPaused(); //need raise interrupt after pause, still need do the timing
@@ -1396,7 +1403,7 @@ static void MAIN_Interrupt()
         {
             for(int i = 0; i < samples*2; i+=2)
             {
-                #if !SBEMU_LINEAR_MIX
+                #if SBEMU_MIX == SBEMU_MIX_MUL
                 // https://stackoverflow.com/questions/12089662/mixing-16-bit-linear-pcm-streams-and-avoiding-clipping-overflow
                 int la = (int)(MAIN_PCM[i] * voicevol/256) + 32768;
                 int ra = (int)(MAIN_PCM[i+1] * voicevol/256) + 32768;
@@ -1411,8 +1418,25 @@ static void MAIN_Interrupt()
                 if(r == 65536) r = 65535;
                 MAIN_PCM[i] = (l - 32768) * vol/256;
                 MAIN_PCM[i+1] = (r - 32768) * vol/256;
+
+                #elif SBEMU_MIX == SBEMU_MIX_CLIP
                 
-                #else //simple average: sounds the same as DOSBox
+                int la = (int)(MAIN_PCM[i] * voicevol/256);
+                int ra = (int)(MAIN_PCM[i+1] * voicevol/256);
+                #if SBEMU_SWAP_STEREO
+                {int x = la; la = ra; ra = x;}
+                #endif
+                int lb = (int)((MAIN_OPLPCM[i]+MAIN_OPLPCM[i]*SBEMU_OPL_VOLUME_AMPLICATION/2) * midivol/256);
+                int rb = (int)((MAIN_OPLPCM[i+1]+MAIN_OPLPCM[i+1]*SBEMU_OPL_VOLUME_AMPLICATION/2) * midivol/256);
+                int l = la+lb;
+                l = (l > 23767 ? 23767 : (l < -32768 ? -32768 : l));
+                int r = ra + rb;
+                r = (r > 23767 ? 23767 : (r < -32768 ? -32768 : r));
+
+                MAIN_PCM[i] = l * vol/256;
+                MAIN_PCM[i+1] = r * vol/256;
+
+                #else //SBEMU_MIX_LINEAR
 
                 int la = (int)(MAIN_PCM[i] * voicevol/256); //SFX PCM
                 int ra = (int)(MAIN_PCM[i+1] * voicevol/256);
@@ -1446,7 +1470,11 @@ static void MAIN_Interrupt()
 
 #if SBEMU_VMPU
     if(vmpu_active)
+    {
+        RESETIF();
         VMPU_GenSamples(MAIN_PCM, samples, aui.freq_card, digital);
+        SETIF();
+    }
 #endif
 
 #if SBEMU_GUS
