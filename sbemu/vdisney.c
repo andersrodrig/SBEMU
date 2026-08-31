@@ -7,7 +7,7 @@
 //   - Detection: games read 0x379, bit7 mirrors bit7 of data byte (inverted on real HW).
 //
 // SBEMU integration:
-//   - Trap ports 0x378 (data), 0x379 (status), 0x37A (control).
+//   - Trap ports 0x378, 0x278, 0x3BC (LPT1, LPT2, LPT3).
 //   - Use a CIRCULAR ring buffer per channel. IO writes push to the ring.
 //   - GenSamples drains the ring at a *fixed* rate with linear interpolation.
 //   - Fixed rate = 7000 Hz (Disney FIFO clock). Games that use Covox directly
@@ -61,8 +61,8 @@ static inline void ring_consume(VDISNEY_Ring *r, int n)
 // State
 // ---------------------------------------------------------------------------
 static struct {
-    uint8_t       data;        // last byte written to 0x378
-    uint8_t       control;     // last byte written to 0x37A
+    uint8_t       data;        // last byte written to data port
+    uint8_t       control;     // last byte written to control port
     int           interface_ext; // FIFO-mode detected (bit3 strobe counter)
 
     VDISNEY_Ring  ch[2];       // ch[0]=left/mono, ch[1]=right
@@ -119,22 +119,36 @@ uint32_t VDISNEY_IOHandler(uint32_t port, uint32_t val, uint32_t out)
 {
     if(!vds.initialized) return val;
 
-    int offset = (int)(port - VDISNEY_BASE);
+    // Suporta LPT1 (0x378), LPT2 (0x278) e LPT3 (0x3BC)
+    static const uint16_t bases[] = {0x378, 0x278, 0x3BC};
+    int base = -1;
+    int offset = -1;
+
+    for(int i = 0; i < 3; i++) {
+        if(port >= bases[i] && port <= bases[i] + 2) {
+            base = bases[i];
+            offset = (int)(port - base);
+            break;
+        }
+    }
+
+    // Se não for uma porta LPT conhecida, retorna sem interceptar
+    if(base == -1) return val;
 
     if(out)
     {
         switch(offset)
         {
-            case 0: // 0x378 — DAC sample byte (mono / leader channel)
+            case 0: // Data port (base+0)
                 vds.data = (uint8_t)(val & 0xFF);
                 ring_push(&vds.ch[0], vds.data);
                 vds.running = 1;
                 break;
 
-            case 1: // 0x379 — read-only status, ignore writes
+            case 1: // Status port (base+1) — read-only, ignore writes
                 break;
 
-            case 2: // 0x37A — control port
+            case 2: // Control port (base+2)
             {
                 uint8_t prev = vds.control;
                 uint8_t cur  = (uint8_t)(val & 0xFF);
@@ -163,24 +177,24 @@ uint32_t VDISNEY_IOHandler(uint32_t port, uint32_t val, uint32_t out)
     {
         switch(offset)
         {
-            case 0: return vds.data;
+            case 0: // Data read (unusual but possible)
+                return vds.data;
 
-            case 1: // 0x379 Status
+            case 1: // Status read
             {
                 uint8_t ret = 0x07;
-                // In FIFO mode: assert busy (clear bit 6) when >= 16 bytes queued
                 if(vds.interface_ext > 5) {
                     if(vds.ch[vds.leader].count >= 16)
                         ret |= 0x40; // FIFO full
                     else
                         ret &= ~0x04;
                 }
-                // Bit7: mirrors ~bit7 of data
                 if(!(vds.data & 0x80)) ret |= 0x80;
                 return ret;
             }
 
-            case 2: return vds.control;
+            case 2: // Control read
+                return vds.control;
         }
     }
     return val;
@@ -209,39 +223,21 @@ void VDISNEY_GenSamples(int16_t *pcm16, int samples, int freq, int domix)
     }
 
     // --- 3. Stable rate via buffer fill level feedback ---
-    //
-    // We target a steady-state buffer fill of TARGET_FILL samples.
-    // The "natural" consume rate per output block is:
-    //   consume = rate_est * samples / freq
-    //
-    // If fill > target: we consumed too slowly last time → increase rate_est.
-    // If fill < target: we consumed too fast → decrease rate_est.
-    //
-    // This is a simple proportional controller. It is inherently stable because:
-    //   - rate increases drain faster → fill drops → rate stops rising
-    //   - rate decreases drain slower → fill rises → rate stops falling
-    //
-    // No EMA over new_writes needed. No trembling.
-
-    // Target: ~80ms of audio at our estimated rate.
-    // Initial boot: if rate_est=7000 and freq=44100, target ≈ 7000*0.08 = 560 samples
     int fill = vds.ch[vds.leader].count;
 
-    // Compute "what rate would exactly consume fill samples in one output block"
-    // fill = rate * samples / freq  →  rate = fill * freq / samples
-    if(fill > 0) {
+    // Only update rate if there's enough data to avoid reacting to empty buffer
+    if(fill > 4) {
         int fill_rate = (int)((double)fill * freq / samples);
-        // Clamp to reasonable audio range
-        if(fill_rate < 4000)  fill_rate = 4000;
+        // Clamp to reasonable audio range (minimum raised to 6000 Hz)
+        if(fill_rate < 6000)  fill_rate = 6000;
         if(fill_rate > 50000) fill_rate = 50000;
 
-        // Smooth toward fill_rate with heavy inertia to avoid trembling:
-        // 7/8 old + 1/8 new  (converges in ~8 blocks ≈ ~90ms at 44100/512)
-        vds.rate_est = (vds.rate_est * 7 + fill_rate) / 8;
+        // More aggressive smoothing: 1/2 old + 1/2 new
+        vds.rate_est = (vds.rate_est + fill_rate) / 2;
     }
 
-    // Final clamp
-    if(vds.rate_est < 4000)  vds.rate_est = 4000;
+    // Final clamp (also raised minimum)
+    if(vds.rate_est < 6000)  vds.rate_est = 6000;
     if(vds.rate_est > 50000) vds.rate_est = 50000;
 
     // --- 4. Resample with linear interpolation ---
@@ -287,8 +283,20 @@ void VDISNEY_GenSamples(int16_t *pcm16, int samples, int freq, int domix)
     }
 
     // --- 5. Consume processed source samples ---
-    int consumed = (int)(vds.phase_fp >> 16);
-    vds.phase_fp &= 0xFFFF; // keep fractional part for continuity
+    int desired_consume = (int)(vds.phase_fp >> 16);
+    int max_consume = (vds.stereo) ? 
+        (vds.ch[0].count < vds.ch[1].count ? vds.ch[0].count : vds.ch[1].count) :
+        vds.ch[0].count;
+
+    int consumed = (desired_consume > max_consume) ? max_consume : desired_consume;
+
+    if(consumed < desired_consume) {
+        // Buffer underflow: reset phase to start fresh next block
+        vds.phase_fp = 0;
+    } else {
+        // Remove the integer part consumed, keep fractional part for continuity
+        vds.phase_fp -= (uint32_t)consumed * 65536;
+    }
 
     ring_consume(&vds.ch[0], consumed);
     ring_consume(&vds.ch[1], consumed);

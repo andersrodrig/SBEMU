@@ -68,6 +68,7 @@
 #define VGUS_GREG_TIMER2_CNT    0x47    // Timer 2 count
 #define VGUS_GREG_SAMPLE_FREQ   0x48    // Sample frequency (for ADC)
 #define VGUS_GREG_SAMPLE_CTRL   0x49    // Sampling control
+#define VGUS_GREG_IRQ_LATCH     0x4B    // IRQ latch control
 #define VGUS_GREG_RESET         0x4C    // Master reset + IRQ/DAC enable
 
 // Voice Control bits
@@ -140,13 +141,17 @@ typedef struct
     uint8_t   dma_ctrl;          // DMA control register (0x41)
     uint32_t  dma_gus_addr;      // Target DRAM address for DMA
     uint32_t  dma_count;         // Bytes to transfer
-    int       dma_irq_pending;   // DMA IRQ pending flag
+    uint8_t   dma_irq_pending;   // DMA IRQ pending flag
 
     // Mixer/control
     uint8_t   mix_ctrl;          // Mix control register (2X0)
     uint8_t   irq_dma_ctrl;      // IRQ/DMA control register (2XB) written value
     uint8_t   reg_ctrl;          // Register controls (2XF)
     uint8_t   reset_reg;         // Reset / IRQ-enable register (0x4C)
+
+    // New registers
+    uint8_t   sample_ctrl;       // Sampling control register (0x49)
+    uint8_t   irq_latch;         // IRQ latch control register (0x4B)
 
     // Timer state
     uint8_t   timer_ctrl;        // Timer control (from 2X8 / GREG 0x45)

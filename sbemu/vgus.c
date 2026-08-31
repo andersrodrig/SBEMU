@@ -47,7 +47,6 @@ static inline int16_t vgus_read_sample16(uint32_t byte_addr)
 // GF1 register read/write helpers
 // ---------------------------------------------------------------------------
 
-// reg: low 7 bits select register, bit7 selects read/write bank (handled by caller)
 static void vgus_gf1_write(uint8_t page, uint8_t reg, uint16_t data)
 {
     // Global registers: page >= 0x40
@@ -74,7 +73,6 @@ static void vgus_gf1_write(uint8_t page, uint8_t reg, uint16_t data)
                 vgus.dram_ptr = (vgus.dram_ptr & 0xFF0000) | data;
                 break;
             case VGUS_GREG_DRAM_ADDR_HI: // 0x44 (8-bit)
-                // GUS Classic only supports up to 1MB (20-bit address). Mask to 4 bits.
                 vgus.dram_ptr = (vgus.dram_ptr & 0x00FFFF) | (((uint32_t)data & 0x0F) << 16);
                 break;
             case VGUS_GREG_TIMER_CTRL:  // 0x45
@@ -106,6 +104,12 @@ static void vgus_gf1_write(uint8_t page, uint8_t reg, uint16_t data)
                 break;
             case VGUS_GREG_TIMER2_CNT:  // 0x47
                 vgus.timer2_count = (uint8_t)data;
+                break;
+            case VGUS_GREG_SAMPLE_CTRL: // 0x49 — sample rate/converter control
+                vgus.sample_ctrl = (uint8_t)data;
+                break;
+            case VGUS_GREG_IRQ_LATCH:   // 0x4B — IRQ latch control
+                vgus.irq_latch = (uint8_t)data;
                 break;
             case VGUS_GREG_RESET:       // 0x4C
                 vgus.reset_reg = (uint8_t)data;
@@ -167,7 +171,6 @@ static void vgus_gf1_write(uint8_t page, uint8_t reg, uint16_t data)
             vv->vol_rate = (uint8_t)data;
             break;
         case VGUS_REG_VOL_START:    // 0x07 — 12-bit index in bits [15:4] of 16-bit register
-            // GUS SDK: register value = volume_index << 4.  Extract: vol = data >> 4.
             vv->vol_start = ((uint16_t)data) << 4;
             break;
         case VGUS_REG_VOL_END:      // 0x08
@@ -209,11 +212,20 @@ static uint16_t vgus_gf1_read(uint8_t page, uint8_t reg)
             case VGUS_GREG_TIMER_CTRL:return vgus.timer_ctrl;
             case VGUS_GREG_TIMER1_CNT:return vgus.timer1_count;
             case VGUS_GREG_TIMER2_CNT:return vgus.timer2_count;
+            case VGUS_GREG_SAMPLE_CTRL: return vgus.sample_ctrl;
+            case VGUS_GREG_IRQ_LATCH:   return vgus.irq_latch;
             // Reset register: bit0=master enable, bit1=DAC enable, bit2=IRQ enable
-            // After writing 0x01 (out of reset), read should return 0x01 immediately
             case VGUS_GREG_RESET:     return vgus.reset_reg;
             case 0x0E:
             case 0x4E: return (uint16_t)((vgus.active_voices - 1) & 0x3F);
+            // Voice IRQ status (global register 0x8F, accessed via page 0x40, reg 0x0F)
+            case 0x0F:
+            {
+                uint8_t voice_irqs = vgus.irq_status & VGUS_IRQ_WAVETABLE;
+                vgus.irq_status &= ~VGUS_IRQ_WAVETABLE;
+                vgus.last_irq_status &= ~VGUS_IRQ_WAVETABLE;
+                return voice_irqs;
+            }
             // IRQ source for DMA: returns DMA_DONE in bit6
             case VGUS_GREG_DMA_CTRL:
             {
@@ -237,7 +249,6 @@ static uint16_t vgus_gf1_read(uint8_t page, uint8_t reg)
         case VGUS_REG_END_HI:       return (uint16_t)((vv->end >> 7) & 0x1FFF);
         case VGUS_REG_END_LO:       return (uint16_t)(vv->end & 0x7F);
         case VGUS_REG_VOL_RATE:     return vv->vol_rate;
-        // Return volume with the 12-bit index back in bits [15:4] as hardware does.
         case VGUS_REG_VOL_START:    return (uint16_t)(vv->vol_start >> 4);
         case VGUS_REG_VOL_END:      return (uint16_t)(vv->vol_end   >> 4);
         case VGUS_REG_CUR_VOL:      return (uint16_t)(vv->volume    << 4);
@@ -309,6 +320,8 @@ void VGUS_Reset(void)
     vgus.gf1_reg       = 0;
     vgus.dram_ptr      = 0;
     vgus.dma_irq_pending = 0;
+    vgus.sample_ctrl   = 0;
+    vgus.irq_latch     = 0;
 }
 
 int VGUS_IsActive(void)
@@ -339,19 +352,11 @@ uint32_t VGUS_IOHandler(uint32_t port, uint32_t val, uint32_t out)
             switch(offset)
             {
                 case VGUS_PORT_MIXCTRL: // 2X0
-                    // bit6=1: 2XB writes IRQ control; bit6=0: DMA control
-                    // bit0=0: line in enabled; bit1=0: line out enabled; bit2=0: mic in
                     vgus.mix_ctrl = (uint8_t)(val & 0xFF);
                     break;
-                case VGUS_PORT_TIMER_CTRL: // 2X8 — GF1 timer control
+                case VGUS_PORT_TIMER_CTRL: // 2X8
                 {
                     uint8_t tc = (uint8_t)(val & 0xFF);
-                    // Per real GUS 2X8 layout:
-                    // Bit 7: set=clear timer IRQ status; clear=load new control
-                    // Bit 6: mask Timer 1 (1=masked)
-                    // Bit 5: mask Timer 2 (1=masked)
-                    // Bit 1: start Timer 2
-                    // Bit 0: start Timer 1
                     if(tc & 0x80)
                     {
                         // Clear timer IRQ status bits only
@@ -362,14 +367,14 @@ uint32_t VGUS_IOHandler(uint32_t port, uint32_t val, uint32_t out)
                     {
                         vgus.timer1_mask = (tc & 0x40) ? 1 : 0;
                         vgus.timer2_mask = (tc & 0x20) ? 1 : 0;
-                        if(tc & 0x01) // start timer 1
+                        if(tc & 0x01)
                         {
                             vgus.timer1_ticks = (vgus.output_freq * (uint32_t)(256 - vgus.timer1_count) * 80) / 1000000;
                             if(vgus.timer1_ticks < 1) vgus.timer1_ticks = 1;
                         } else {
                             vgus.timer1_ticks = 0;
                         }
-                        if(tc & 0x02) // start timer 2
+                        if(tc & 0x02)
                         {
                             vgus.timer2_ticks = (vgus.output_freq * (uint32_t)(256 - vgus.timer2_count) * 320) / 1000000;
                             if(vgus.timer2_ticks < 1) vgus.timer2_ticks = 1;
@@ -388,8 +393,6 @@ uint32_t VGUS_IOHandler(uint32_t port, uint32_t val, uint32_t out)
                     break;
                 case VGUS_PORT_IRQ_DMA_CTRL: // 2XB
                     vgus.irq_dma_ctrl = (uint8_t)(val & 0xFF);
-                    // This register controls which IRQ/DMA lines are active.
-                    // We store it for ULTRASND detection; actual routing is fixed.
                     break;
                 case VGUS_PORT_REG_CTRL: // 2XF
                     vgus.reg_ctrl = (uint8_t)(val & 0xFF);
@@ -405,7 +408,7 @@ uint32_t VGUS_IOHandler(uint32_t port, uint32_t val, uint32_t out)
                 case VGUS_PORT_IRQ_STATUS:  // 2X6
                 {
                     uint8_t s = vgus.irq_status;
-                    // Reading 2X6 only clears Timer IRQs. DMA/Voice IRQs are cleared via 0x41/0x8F.
+                    // Reading 2X6 only clears Timer IRQs; other IRQs cleared via specific regs.
                     vgus.irq_status &= ~(VGUS_IRQ_TIMER1 | VGUS_IRQ_TIMER2);
                     vgus.last_irq_status &= ~(VGUS_IRQ_TIMER1 | VGUS_IRQ_TIMER2);
                     return s;
@@ -416,8 +419,7 @@ uint32_t VGUS_IOHandler(uint32_t port, uint32_t val, uint32_t out)
                 case VGUS_PORT_IRQ_DMA_CTRL: return vgus.irq_dma_ctrl;
                 case VGUS_PORT_REG_CTRL:
                     // Bits [7:4] = board revision 4 (GUS Classic production).
-                    // Bits [3:0] = 0xF (all capability flags asserted).
-                    // ULTRINIT checks this port to confirm GUS presence.
+                    // Bits [3:0] = capability flags: 0xF indicates all features present.
                     return 0x4F;
                 default:                    return 0xFF;
             }
@@ -434,12 +436,15 @@ uint32_t VGUS_IOHandler(uint32_t port, uint32_t val, uint32_t out)
         int is8bit = 0;
         uint8_t r = vgus.gf1_reg & 0x7F;
         if(vgus.gf1_page >= 0x40) {
-            // 8-bit global regs: DMA ctrl, timer ctrl/counts, sample ctrl, IRQ latch, reset, active voices, DRAM addr high
-            if(r == 0x41 || r == 0x44 || r == 0x45 || r == 0x46 || r == 0x47 || r == 0x49 || r == 0x4B || r == 0x4C
-               || r == 0x0E || r == 0x4E) is8bit = 1;
+            // 8-bit global regs: DMA ctrl, DRAM addr high, timer ctrl/counts,
+            // sample ctrl, IRQ latch, reset, active voices
+            if(r == 0x41 || r == 0x44 || r == 0x45 || r == 0x46 || r == 0x47 ||
+               r == 0x49 || r == 0x4B || r == 0x4C || r == 0x0E || r == 0x4E) is8bit = 1;
         } else {
-            // 8-bit voice regs: voice ctrl, vol rate, panning, vol ctrl, vol start, vol end, active voices
-            if(r == 0x00 || r == 0x06 || r == 0x07 || r == 0x08 || r == 0x0C || r == 0x0D || r == 0x0E || r == 0x4E) is8bit = 1;
+            // 8-bit voice regs: voice ctrl, vol rate, panning, vol ctrl,
+            // vol start, vol end, active voices
+            if(r == 0x00 || r == 0x06 || r == 0x07 || r == 0x08 ||
+               r == 0x0C || r == 0x0D || r == 0x0E || r == 0x4E) is8bit = 1;
         }
 
         if(out)
@@ -462,19 +467,14 @@ uint32_t VGUS_IOHandler(uint32_t port, uint32_t val, uint32_t out)
                 case VGUS_PORT_GF1_DATAHI - 0x100: // 3X5
                 {
                     if(is8bit) {
-                        _LOG("GUS W8: page=%02x reg=%02x val=%02x rst=%02x\n",
-                             vgus.gf1_page, vgus.gf1_reg & 0x7F, (unsigned)(val & 0xFF), vgus.reset_reg);
                         vgus_gf1_write(vgus.gf1_page, vgus.gf1_reg, (uint16_t)(val & 0xFF));
                     } else {
                         uint16_t data16 = vgus.gf1_data_latch | ((uint16_t)(val & 0xFF) << 8);
-                        _LOG("GUS W16: page=%02x reg=%02x val=%04x\n",
-                             vgus.gf1_page, vgus.gf1_reg & 0x7F, (unsigned)data16);
                         vgus_gf1_write(vgus.gf1_page, vgus.gf1_reg, data16);
                     }
                     break;
                 }
                 case VGUS_PORT_GF1_DRAM - 0x100:  // 3X7 write
-                    _LOG("GUS DRAM W: ptr=%06x val=%02x\n", vgus.dram_ptr, (unsigned)(val & 0xFF));
                     if(vgus.dram)
                     {
                         uint32_t addr = vgus.dram_ptr & (VGUS_DRAM_SIZE - 1);
@@ -496,12 +496,8 @@ uint32_t VGUS_IOHandler(uint32_t port, uint32_t val, uint32_t out)
                 case VGUS_PORT_GF1_DATALO - 0x100: // 3X4
                 {
                     if(is8bit) {
-                        // 8-bit GF1 registers follow DOSBox convention: the real value
-                        // is placed in the HIGH byte, so 3X4 (low byte) always reads 0.
-                        // Programs that want the value must read from 3X5 instead.
                         return 0;
                     } else {
-                        // 16-bit register: return low byte and latch high byte for 3X5.
                         uint16_t d = vgus_gf1_read(vgus.gf1_page, vgus.gf1_reg);
                         vgus.gf1_data_latch = (uint8_t)(d >> 8);
                         return (d & 0xFF);
@@ -511,23 +507,17 @@ uint32_t VGUS_IOHandler(uint32_t port, uint32_t val, uint32_t out)
                 {
                     uint32_t rd;
                     if(is8bit) {
-                        // 8-bit register: read the actual value directly (like DOSBox >> 8 on val<<8)
                         rd = vgus_gf1_read(vgus.gf1_page, vgus.gf1_reg) & 0xFF;
                     } else {
-                        // 16-bit register: return the high byte latched during 3X4 read
                         rd = vgus.gf1_data_latch;
                     }
-                    _LOG("GUS R5: page=%02x reg=%02x ret=%02x is8=%d\n",
-                         vgus.gf1_page, vgus.gf1_reg & 0x7F, rd, is8bit);
                     return rd;
                 }
-
                 case VGUS_PORT_GF1_DRAM - 0x100:  // 3X7 read
                     if(vgus.dram)
                     {
                         uint32_t addr = vgus.dram_ptr & (VGUS_DRAM_SIZE - 1);
                         uint8_t b = vgus.dram[addr];
-                        // _LOG("GUS DRAM R: ptr=%06x val=%02x\n", vgus.dram_ptr, b);
                         vgus.dram_ptr = (vgus.dram_ptr + 1) & 0xFFFFFF;
                         return b;
                     }
@@ -543,7 +533,6 @@ uint32_t VGUS_IOHandler(uint32_t port, uint32_t val, uint32_t out)
 
 // ---------------------------------------------------------------------------
 // DMA simulation: called when the ISA DMA transfer completes from main.c
-// bytes: pointer to data, count: number of bytes transferred
 // ---------------------------------------------------------------------------
 void VGUS_DMATransfer(uint8_t *data, uint32_t count)
 {
@@ -563,7 +552,7 @@ void VGUS_DMATransfer(uint8_t *data, uint32_t count)
         } else {
             uint8_t b = data[i];
             if(vgus.dma_ctrl & VGUS_DMA_FLIP_MSB)
-                b ^= 0x80; // convert unsigned to signed (common for GUS samples)
+                b ^= 0x80;
             vgus.dram[addr] = b;
         }
         addr = (addr + 1) & (VGUS_DRAM_SIZE - 1);
@@ -588,14 +577,6 @@ void VGUS_GenSamples(int16_t *pcm16, int samples, int freq, int domix)
 {
     if(!VGUS_IsActive()) return;
 
-    // Frequency step per sample for a given voice:
-    //   GF1 freq register = (playback_hz * 512) / (output_hz * voices_factor)
-    //   increment = freq_reg * output_freq_scale
-    //   The GF1 uses a 19-bit integer + 9-bit fractional address format.
-    //   freq_reg encodes: (desired_hz / (output_hz)) * 512 in 16-bit form.
-    //   So per output sample, position advances by: freq_reg * (gus_osc_rate / output_freq)
-    //   The GUS oscillator base is 9.878 MHz / (active_voices * 2) — simplified here.
-
     int voices = vgus.active_voices;
     if(voices < 14) voices = 14;
     if(voices > 32) voices = 32;
@@ -608,19 +589,15 @@ void VGUS_GenSamples(int16_t *pcm16, int samples, int freq, int domix)
         {
             VGUS_Voice *vv = &vgus.voice[v];
 
-            // Skip stopped or muted voices
             if((vv->ctrl & VGUS_VC_STOPPED) || (vv->ctrl & VGUS_VC_STOP))
                 continue;
             if(vv->volume == 0)
                 continue;
 
-            // Get sample from DRAM
-            // Position is in 23.9 fixed-point (bits 31..9 = byte addr, bits 8..0 = fraction)
             uint32_t byte_addr = vv->current >> 9;
             int16_t sample;
             if(vv->ctrl & VGUS_VC_16BIT)
             {
-                // 16-bit samples: byte address must be doubled and aligned
                 byte_addr = (byte_addr & 0x0C0000) | ((byte_addr & ~0x0C0000) << 1);
                 sample = vgus_read_sample16(byte_addr);
             }
@@ -629,20 +606,14 @@ void VGUS_GenSamples(int16_t *pcm16, int samples, int freq, int domix)
                 sample = vgus_read_sample8(byte_addr);
             }
 
-            // Apply volume (0-4095 → 0-1.0 scale, using shift)
             int32_t sv = ((int32_t)sample * vv->volume) >> 12;
 
-            // Panning: 0=left, 8=center, 15=right
-            int pan = vv->panning; // 0..15
-            int32_t lvol = (15 - pan); // 15..0
-            int32_t rvol = pan;        // 0..15
+            int pan = vv->panning;
+            int32_t lvol = (15 - pan);
+            int32_t rvol = pan;
             out_l += (sv * lvol) >> 4;
             out_r += (sv * rvol) >> 4;
 
-            // Advance position.
-            // GF1 freq register: bit 0 is always 0 on hardware; the real step is
-            // (freq_reg >> 1) in 1/512 sub-sample units — matching DOSBox WAVE_FRACT=9.
-            // Using the raw register value (without >>1) doubles pitch/speed.
             uint32_t advance = vv->freq >> 1;
             int backwards = (vv->ctrl & VGUS_VC_BACKWARDS) ? 1 : 0;
 
@@ -658,7 +629,6 @@ void VGUS_GenSamples(int16_t *pcm16, int samples, int freq, int domix)
                 vv->current += advance;
             }
 
-            // Loop / boundary handling
             if(!backwards && vv->current >= vv->end)
             {
                 if(vv->ctrl & VGUS_VC_LOOP)
@@ -666,7 +636,7 @@ void VGUS_GenSamples(int16_t *pcm16, int samples, int freq, int domix)
                     if(vv->ctrl & VGUS_VC_BIDIR)
                     {
                         vv->current = vv->end;
-                        vv->ctrl |= VGUS_VC_BACKWARDS; // reverse
+                        vv->ctrl |= VGUS_VC_BACKWARDS;
                     }
                     else
                     {
@@ -689,7 +659,7 @@ void VGUS_GenSamples(int16_t *pcm16, int samples, int freq, int domix)
                     if(vv->ctrl & VGUS_VC_BIDIR)
                     {
                         vv->current = vv->start;
-                        vv->ctrl &= ~VGUS_VC_BACKWARDS; // forward again
+                        vv->ctrl &= ~VGUS_VC_BACKWARDS;
                     }
                     else
                     {
@@ -706,13 +676,10 @@ void VGUS_GenSamples(int16_t *pcm16, int samples, int freq, int domix)
                     vgus.irq_status |= VGUS_IRQ_WAVETABLE;
             }
 
-            // Volume ramp
             if(!(vv->vol_ctrl & (VGUS_VC_STOPPED | VGUS_VC_STOP)))
             {
                 int going_up = !(vv->vol_ctrl & VGUS_VC_BACKWARDS);
-                // GUS SDK: vol_rate bits [7:6] = scale (0=×1, 1=×8, 2=×64, 3=×512),
-                // bits [5:0] = speed index. Scale is encoded as 3 extra shift bits.
-                int scale_shift = ((vv->vol_rate >> 6) & 0x3) * 3; // 0, 3, 6, or 9
+                int scale_shift = ((vv->vol_rate >> 6) & 0x3) * 3;
                 int speed       = vv->vol_rate & 0x3F;
                 int step        = speed ? (1 << scale_shift) : 0;
                 if(step < 1 && speed) step = 1;
@@ -744,11 +711,6 @@ void VGUS_GenSamples(int16_t *pcm16, int samples, int freq, int domix)
             }
         }
 
-        // GUS hardware sums all voices and clips — no per-voice normalization.
-        // Dividing by active_voices is wrong: it mutes single voices when 32 are
-        // configured but only 1 or 2 are actually playing.
-        // clamp16() below handles saturation naturally.
-
         if(domix)
         {
             pcm16[s*2]   = clamp16((int)pcm16[s*2]   + out_l);
@@ -770,8 +732,8 @@ void VGUS_TickTimers(uint32_t delta_samples, int freq, void (*raiseIRQ)(uint8_t)
     if(!VGUS_IsActive()) return;
     if(!(vgus.reset_reg & 0x04)) return; // IRQ not enabled in reset register
 
-    // Timer 1 (80µs resolution) — bit0 of timer_ctrl = started
-    if(vgus.timer_ctrl & 0x01) // started
+    // Timer 1
+    if(vgus.timer_ctrl & 0x01)
     {
         if(vgus.timer1_ticks <= delta_samples)
         {
@@ -780,7 +742,6 @@ void VGUS_TickTimers(uint32_t delta_samples, int freq, void (*raiseIRQ)(uint8_t)
             {
                 vgus.irq_status |= VGUS_IRQ_TIMER1;
             }
-            // Restart timer
             vgus.timer1_ticks = (freq * (uint32_t)(256 - vgus.timer1_count) * 80) / 1000000;
             if(vgus.timer1_ticks < 1) vgus.timer1_ticks = 1;
         }
@@ -790,8 +751,8 @@ void VGUS_TickTimers(uint32_t delta_samples, int freq, void (*raiseIRQ)(uint8_t)
         }
     }
 
-    // Timer 2 (320µs resolution) — bit1 of timer_ctrl = started
-    if(vgus.timer_ctrl & 0x02) // started
+    // Timer 2
+    if(vgus.timer_ctrl & 0x02)
     {
         if(vgus.timer2_ticks <= delta_samples)
         {
@@ -809,18 +770,14 @@ void VGUS_TickTimers(uint32_t delta_samples, int freq, void (*raiseIRQ)(uint8_t)
         }
     }
 
-    // DMA-done IRQ: fire the GUS IRQ line so the game's ISR is notified
-    // that the patch upload has completed.  Previously this flag was cleared
-    // without ever calling raiseIRQ, so ULTRINIT waited forever.
+    // DMA-done IRQ: only set the bit; do not call raiseIRQ here to avoid duplication.
     if(vgus.dma_irq_pending)
     {
         vgus.dma_irq_pending = 0;
         vgus.irq_status |= VGUS_IRQ_DMA_TC;
-        if(raiseIRQ) raiseIRQ((uint8_t)vgus.irq);
     }
 
-    // Edge-trigger ALL IRQs — only fire when a new bit becomes set
-    // AND only when IRQ is enabled in reset register (bit2)
+    // Edge-trigger ALL IRQs — fire only on newly set bits.
     if(vgus.reset_reg & 0x04)
     {
         uint8_t newly_set = vgus.irq_status & ~vgus.last_irq_status;
